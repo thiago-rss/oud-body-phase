@@ -1,0 +1,14 @@
+# Build e artefatos CMake / Xcode
+build/
+cmake-build-*/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+
+# Arquivos temporarios e do sistema macOS
+.DS_Store
+._*
+*.log
+
+# Evite subir JUCE inteiro se estiver dentro da pasta do projeto
+JUCE/
