@@ -21,12 +21,13 @@ private:
 
     juce::TextButton botaoTema { "Nahar" };
 
-    // Controles de Fase e Alinhamento
-    juce::ToggleButton botaoFase { "Inverter Fase (180°)" };
+    // Controles e Medidor de Fase e Alinhamento
+    juce::ToggleButton botaoFase;
     juce::Label rotuloAlvoFase;
     juce::ComboBox caixaAlvoFase;
     juce::Label rotuloAtraso;
     juce::Slider sliderAtraso;
+    MedidorCorrelacaoFase medidorCorrelacao;
 
     // Controles de Corpo e Caixa
     juce::Label rotuloHp;
@@ -65,7 +66,10 @@ private:
     juce::Rectangle<int> painelRisha;
     juce::Rectangle<int> painelSaida;
 
+    bool modoMono = false;
+
     void timerCallback() override;
+    void atualizarModoCanais (bool forcarLayout = false);
     void alternarTema();
     void aplicarCoresComponentes();
     void configurarRotulo (juce::Label& rotulo, const juce::String& texto);

@@ -1,269 +1,111 @@
+#include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include <algorithm>
+#include <cmath>
 
-OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhaseAudioProcessor& p)
-    : AudioProcessorEditor (&p), audioProcessor (p)
+OudBodyPhaseAudioProcessor::OudBodyPhaseAudioProcessor()
+    : AudioProcessor (BusesProperties()
+          .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "PARAMETROS_OUD", criarLayoutParametrosOud())
 {
-    setLookAndFeel (&oudLookAndFeel);
-
-    botaoTema.setTooltip ("Alternar entre tema Ebano e tema claro Nahar");
-    botaoTema.onClick = [this] { alternarTema(); };
-    addAndMakeVisible (botaoTema);
-
-    addAndMakeVisible (botaoFase);
-
-    configurarRotulo (rotuloAlvoFase, "Alvo");
-    caixaAlvoFase.addItemList ({ "Ambos", "Canal 1", "Canal 2" }, 1);
-    addAndMakeVisible (caixaAlvoFase);
-
-    configurarRotulo (rotuloAtraso, "Atraso");
-    configurarRotulo (rotuloHp, "HPF");
-    configurarRotulo (rotuloCaixaFreq, "Freq Caixa");
-    configurarRotulo (rotuloCaixaGanho, "Ganho Caixa");
-    configurarRotulo (rotuloRisha, "Suavizar Risha");
-    configurarRotulo (rotuloSaida, "Ganho Saida");
-
-    configurarKnob (sliderAtraso);
-    configurarKnob (sliderHp);
-    configurarKnob (sliderCaixaFreq);
-    configurarKnob (sliderCaixaGanho);
-    configurarKnob (sliderRisha);
-    configurarKnob (sliderSaida);
-
-    addAndMakeVisible (medidorRisha);
-    addAndMakeVisible (medidorSaida);
-
-    attachFase       = std::make_unique<ButtonAttachment>   (audioProcessor.apvts, OudParamIDs::inverterFase,  botaoFase);
-    attachAlvoFase   = std::make_unique<ComboBoxAttachment> (audioProcessor.apvts, OudParamIDs::alvoFase,      caixaAlvoFase);
-    attachAtraso     = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::atrasoFinoMs,  sliderAtraso);
-    attachHp         = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::freqCorteHpHz, sliderHp);
-    attachCaixaFreq  = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::freqCaixaHz,   sliderCaixaFreq);
-    attachCaixaGanho = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::ganhoCaixaDb,  sliderCaixaGanho);
-    attachRisha      = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::suavizarRisha, sliderRisha);
-    attachSaida      = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::ganhoSaidaDb,  sliderSaida);
-
-    aplicarCoresComponentes();
-    setSize (900, 336);
-    startTimerHz (30);
 }
 
-OudBodyPhaseAudioProcessorEditor::~OudBodyPhaseAudioProcessorEditor()
+bool OudBodyPhaseAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    stopTimer();
-    setLookAndFeel (nullptr);
+    const auto& mainIn  = layouts.getMainInputChannelSet();
+    const auto& mainOut = layouts.getMainOutputChannelSet();
+
+    if (mainIn != mainOut)
+        return false;
+
+    return mainIn == juce::AudioChannelSet::mono()
+        || mainIn == juce::AudioChannelSet::stereo();
 }
 
-void OudBodyPhaseAudioProcessorEditor::timerCallback()
+void OudBodyPhaseAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    medidorRisha.atualizarLeitura (audioProcessor.consumirReducaoRishaDb());
-    medidorSaida.atualizarLeitura (audioProcessor.consumirPicoSaidaLinear());
+    const int canaisAtivos = std::max (1, getMainBusNumInputChannels());
+    numCanaisAtivos.store (canaisAtivos, std::memory_order_relaxed);
+
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = static_cast<juce::uint32> (std::max (1, samplesPerBlock));
+    spec.numChannels = static_cast<juce::uint32> (std::max (2, canaisAtivos));
+
+    cadeiaDsp.prepare (spec);
+    cadeiaDsp.reset();
+    setLatencySamples (CadeiaDspOud::getLatenciaAmostras());
+
+    medidorReducaoRisha.reset();
+    medidorPicoSaida.reset();
+    medidorCorrelacaoFase.reset();
 }
 
-void OudBodyPhaseAudioProcessorEditor::alternarTema()
+void OudBodyPhaseAudioProcessor::releaseResources()
 {
-    const bool proximoClaro = ! oudLookAndFeel.estaTemaClaro();
-    oudLookAndFeel.aplicarTema (proximoClaro);
-    botaoTema.setButtonText (proximoClaro ? "Ebano" : "Nahar");
-    aplicarCoresComponentes();
-    repaint();
+    cadeiaDsp.reset();
+    medidorReducaoRisha.reset();
+    medidorPicoSaida.reset();
+    medidorCorrelacaoFase.reset();
 }
 
-void OudBodyPhaseAudioProcessorEditor::aplicarCoresComponentes()
+void OudBodyPhaseAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
+                                               juce::MidiBuffer& midiMessages)
 {
-    const auto& pal = oudLookAndFeel.getPaleta();
-    const bool temaClaro = oudLookAndFeel.estaTemaClaro();
+    juce::ignoreUnused (midiMessages);
+    juce::ScopedNoDenormals noDenormals;
 
-    auto atualizarLabel = [&] (juce::Label& lbl, bool destaque = false)
-    {
-        lbl.setFont (oudLookAndFeel.getFonteInterface (11.5f, true));
-        lbl.setColour (juce::Label::textColourId, destaque ? pal.textoSecundario : pal.textoSuave);
-    };
+    const auto totalCanaisEntrada = getTotalNumInputChannels();
+    const auto totalCanaisSaida   = getTotalNumOutputChannels();
 
-    atualizarLabel (rotuloAlvoFase, true);
-    atualizarLabel (rotuloAtraso);
-    atualizarLabel (rotuloHp);
-    atualizarLabel (rotuloCaixaFreq);
-    atualizarLabel (rotuloCaixaGanho);
-    atualizarLabel (rotuloRisha);
-    atualizarLabel (rotuloSaida);
+    numCanaisAtivos.store (std::max (1, buffer.getNumChannels()), std::memory_order_relaxed);
 
-    auto atualizarSlider = [&] (juce::Slider& s)
-    {
-        s.setColour (juce::Slider::textBoxTextColourId, pal.textoPrincipal);
-        s.setColour (juce::Slider::textBoxBackgroundColourId, pal.input);
-        s.setColour (juce::Slider::textBoxOutlineColourId, pal.bordaSutil);
-    };
+    for (auto i = totalCanaisEntrada; i < totalCanaisSaida; ++i)
+        buffer.clear (i, 0, buffer.getNumSamples());
 
-    atualizarSlider (sliderAtraso);
-    atualizarSlider (sliderHp);
-    atualizarSlider (sliderCaixaFreq);
-    atualizarSlider (sliderCaixaGanho);
-    atualizarSlider (sliderRisha);
-    atualizarSlider (sliderSaida);
+    ParametrosDspOud p;
+    p.inverterFase  = apvts.getRawParameterValue (OudParamIDs::inverterFase)->load() > 0.5f;
+    p.atrasoFinoMs  = apvts.getRawParameterValue (OudParamIDs::atrasoFinoMs)->load();
 
-    medidorRisha.setTemaClaro (temaClaro);
-    medidorSaida.setTemaClaro (temaClaro);
+    const int escolhaAlvo = static_cast<int> (
+        std::lround (apvts.getRawParameterValue (OudParamIDs::alvoFase)->load()));
+    p.alvoFase      = static_cast<AlvoCanalFase> (juce::jlimit (0, 2, escolhaAlvo));
+
+    p.freqCorteHpHz = apvts.getRawParameterValue (OudParamIDs::freqCorteHpHz)->load();
+    p.freqCaixaHz   = apvts.getRawParameterValue (OudParamIDs::freqCaixaHz)->load();
+    p.ganhoCaixaDb  = apvts.getRawParameterValue (OudParamIDs::ganhoCaixaDb)->load();
+    p.suavizarRisha = apvts.getRawParameterValue (OudParamIDs::suavizarRisha)->load();
+    p.ganhoSaidaDb  = apvts.getRawParameterValue (OudParamIDs::ganhoSaidaDb)->load();
+
+    cadeiaDsp.atualizarParametros (p);
+
+    const auto leitura = cadeiaDsp.process (buffer);
+    medidorReducaoRisha.registrarPico (leitura.reducaoRishaDb);
+    medidorPicoSaida.registrarPico (leitura.picoSaidaLinear);
+    medidorCorrelacaoFase.registrar (leitura.correlacao);
 }
 
-void OudBodyPhaseAudioProcessorEditor::configurarRotulo (juce::Label& rotulo, const juce::String& texto)
+juce::AudioProcessorEditor* OudBodyPhaseAudioProcessor::createEditor()
 {
-    rotulo.setText (texto, juce::dontSendNotification);
-    rotulo.setJustificationType (juce::Justification::centred);
-    addAndMakeVisible (rotulo);
+    return new OudBodyPhaseAudioProcessorEditor (*this);
 }
 
-void OudBodyPhaseAudioProcessorEditor::configurarKnob (juce::Slider& slider)
+void OudBodyPhaseAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
-    addAndMakeVisible (slider);
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml (state.createXml());
+    copyXmlToBinary (*xml, destData);
 }
 
-void OudBodyPhaseAudioProcessorEditor::desenharCartaoSecao (juce::Graphics& g,
-                                                            juce::Rectangle<int> area,
-                                                            const juce::String& titulo,
-                                                            juce::Colour corTitulo)
+void OudBodyPhaseAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    if (area.isEmpty())
-        return;
-
-    const auto& pal = oudLookAndFeel.getPaleta();
-    const auto rectF = area.toFloat();
-
-    g.setColour (pal.superficie);
-    g.fillRoundedRectangle (rectF, 13.0f);
-
-    g.setColour (pal.bordaSutil);
-    g.drawRoundedRectangle (rectF, 13.0f, 1.0f);
-
-    g.setColour (corTitulo);
-    g.setFont (oudLookAndFeel.getFonteInterface (10.5f, true));
-    g.drawText (titulo.toUpperCase(),
-                area.reduced (12, 8).removeFromTop (15),
-                juce::Justification::centredLeft, false);
+    std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
+    if (xmlState != nullptr && xmlState->hasTagName (apvts.state.getType()))
+        apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
 }
 
-void OudBodyPhaseAudioProcessorEditor::posicionarKnob (juce::Rectangle<int> coluna,
-                                                       juce::Label& rotulo,
-                                                       juce::Slider& knob)
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    auto conteudo = coluna.reduced (4, 2);
-    rotulo.setBounds (conteudo.removeFromTop (18));
-    knob.setBounds (conteudo);
-}
-
-void OudBodyPhaseAudioProcessorEditor::paint (juce::Graphics& g)
-{
-    const auto& pal = oudLookAndFeel.getPaleta();
-
-    // Fundo em gradiente sutil no mesmo espirito de --bg-page-grad
-    juce::ColourGradient gradienteFundo (
-        pal.fundoDeep.brighter (0.04f), 0.0f, 0.0f,
-        pal.fundoDeep.darker (0.12f), 0.0f, static_cast<float> (getHeight()), false);
-    g.setGradientFill (gradienteFundo);
-    g.fillAll();
-
-    // Cartao de cabecalho estilo .studio-header
-    if (! cartaoCabecalho.isEmpty())
-    {
-        const auto cabF = cartaoCabecalho.toFloat();
-        g.setColour (pal.superficie);
-        g.fillRoundedRectangle (cabF, 14.0f);
-        g.setColour (pal.bordaSutil);
-        g.drawRoundedRectangle (cabF, 14.0f, 1.0f);
-
-        auto interno = cartaoCabecalho.reduced (14, 6);
-        interno.removeFromRight (88);
-
-        g.setColour (pal.textoPrincipal);
-        g.setFont (oudLookAndFeel.getFonteTitulo (22.0f));
-        g.drawText ("Oud Body Phase", interno.removeFromLeft (195), juce::Justification::centredLeft);
-
-        g.setColour (pal.textoSuave);
-        g.setFont (oudLookAndFeel.getFonteInterface (11.5f, false));
-        g.drawText ("Fase, Escultura de Caixa & Risha", interno, juce::Justification::centredLeft);
-    }
-
-    desenharCartaoSecao (g, painelFase,  "Fase & Alinhamento", pal.latao);
-    desenharCartaoSecao (g, painelCaixa, "Corpo & Caixa",      pal.latao);
-    desenharCartaoSecao (g, painelRisha, "Risha",              pal.ameixa);
-    desenharCartaoSecao (g, painelSaida, "Saida",              pal.latao);
-}
-
-void OudBodyPhaseAudioProcessorEditor::resized()
-{
-    auto area = getLocalBounds().reduced (14, 12);
-
-    cartaoCabecalho = area.removeFromTop (46);
-    {
-        auto internoCab = cartaoCabecalho.reduced (14, 6);
-        auto direitaCab = internoCab.removeFromRight (88);
-        botaoTema.setBounds (direitaCab.withSizeKeepingCentre (76, 28));
-    }
-
-    area.removeFromTop (10);
-
-    const int gap = 10;
-    const int larguraUtil = area.getWidth() - gap * 3;
-
-    const int wFase  = static_cast<int> (larguraUtil * 0.30f);
-    const int wCaixa = static_cast<int> (larguraUtil * 0.35f);
-    const int wRisha = static_cast<int> (larguraUtil * 0.175f);
-    const int wSaida = std::max (120, larguraUtil - wFase - wCaixa - wRisha);
-
-    painelFase  = area.removeFromLeft (wFase);
-    area.removeFromLeft (gap);
-    painelCaixa = area.removeFromLeft (wCaixa);
-    area.removeFromLeft (gap);
-    painelRisha = area.removeFromLeft (wRisha);
-    area.removeFromLeft (gap);
-    painelSaida = area;
-
-    // 1. Fase & Alinhamento
-    {
-        auto inner = painelFase.reduced (10, 8);
-        inner.removeFromTop (18);
-
-        auto linhaTopo = inner.removeFromTop (30);
-        botaoFase.setBounds (linhaTopo.removeFromLeft (142));
-        linhaTopo.removeFromLeft (6);
-        rotuloAlvoFase.setBounds (linhaTopo.removeFromLeft (30));
-        caixaAlvoFase.setBounds (linhaTopo);
-
-        inner.removeFromTop (6);
-        posicionarKnob (inner, rotuloAtraso, sliderAtraso);
-    }
-
-    // 2. Corpo & Caixa
-    {
-        auto inner = painelCaixa.reduced (10, 8);
-        inner.removeFromTop (18);
-
-        const int wCol = inner.getWidth() / 3;
-        posicionarKnob (inner.removeFromLeft (wCol), rotuloHp,         sliderHp);
-        posicionarKnob (inner.removeFromLeft (wCol), rotuloCaixaFreq,  sliderCaixaFreq);
-        posicionarKnob (inner,                       rotuloCaixaGanho, sliderCaixaGanho);
-    }
-
-    // 3. Risha + Medidor de Reducao (GR)
-    {
-        auto inner = painelRisha.reduced (10, 8);
-        inner.removeFromTop (18);
-
-        auto areaMedidor = inner.removeFromRight (26);
-        inner.removeFromRight (6);
-        medidorRisha.setBounds (areaMedidor.reduced (0, 4));
-        posicionarKnob (inner, rotuloRisha, sliderRisha);
-    }
-
-    // 4. Saida + Medidor de Pico (dBFS + Clip)
-    {
-        auto inner = painelSaida.reduced (10, 8);
-        inner.removeFromTop (18);
-
-        auto areaMedidor = inner.removeFromRight (26);
-        inner.removeFromRight (6);
-        medidorSaida.setBounds (areaMedidor.reduced (0, 4));
-        posicionarKnob (inner, rotuloSaida, sliderSaida);
-    }
+    return new OudBodyPhaseAudioProcessor();
 }

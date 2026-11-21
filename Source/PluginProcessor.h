@@ -1,6 +1,8 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <algorithm>
+#include <atomic>
 #include "OudParameters.h"
 #include "OudDspChain.h"
 
@@ -39,13 +41,22 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
-    float consumirReducaoRishaDb() noexcept  { return medidorReducaoRisha.consumirPico(); }
-    float consumirPicoSaidaLinear() noexcept { return medidorPicoSaida.consumirPico(); }
+    float consumirReducaoRishaDb() noexcept                 { return medidorReducaoRisha.consumirPico(); }
+    float consumirPicoSaidaLinear() noexcept                { return medidorPicoSaida.consumirPico(); }
+    LeituraCorrelacaoOud lerCorrelacaoFase() const noexcept { return medidorCorrelacaoFase.ler(); }
+
+    int getNumCanaisAtivos() const noexcept
+    {
+        const int atomico = numCanaisAtivos.load (std::memory_order_relaxed);
+        return (atomico > 0) ? atomico : std::max (1, getMainBusNumInputChannels());
+    }
 
 private:
     CadeiaDspOud cadeiaDsp;
     MedidorAtomico medidorReducaoRisha;
     MedidorAtomico medidorPicoSaida;
+    MedidorCorrelacaoAtomico medidorCorrelacaoFase;
+    std::atomic<int> numCanaisAtivos { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OudBodyPhaseAudioProcessor)
 };

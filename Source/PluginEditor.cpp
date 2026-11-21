@@ -6,14 +6,17 @@ OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhase
 {
     setLookAndFeel (&oudLookAndFeel);
 
-    botaoTema.setTooltip ("Alternar entre tema Ebano e tema claro Nahar");
+    botaoTema.setTooltip (juce::String::fromUTF8 ("Alternar entre tema " "\xc3\x89" "bano e tema claro Nahar"));
     botaoTema.onClick = [this] { alternarTema(); };
     addAndMakeVisible (botaoTema);
 
+    botaoFase.setButtonText (juce::String::fromUTF8 ("Inverter Fase (180" "\xc2\xb0" ")"));
     addAndMakeVisible (botaoFase);
 
     configurarRotulo (rotuloAlvoFase, "Alvo");
     caixaAlvoFase.addItemList ({ "Ambos", "Canal 1", "Canal 2" }, 1);
+    caixaAlvoFase.setTooltip (juce::String::fromUTF8 (
+        "Escolha Canal 1 ou Canal 2 para inverter/alinhar uma fonte contra a outra (Ambos mant" "\xc3\xa9" "m a fase relativa)"));
     addAndMakeVisible (caixaAlvoFase);
 
     configurarRotulo (rotuloAtraso, "Atraso");
@@ -21,7 +24,7 @@ OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhase
     configurarRotulo (rotuloCaixaFreq, "Freq Caixa");
     configurarRotulo (rotuloCaixaGanho, "Ganho Caixa");
     configurarRotulo (rotuloRisha, "Suavizar Risha");
-    configurarRotulo (rotuloSaida, "Ganho Saida");
+    configurarRotulo (rotuloSaida, juce::String::fromUTF8 ("Ganho Sa" "\xc3\xad" "da"));
 
     configurarKnob (sliderAtraso);
     configurarKnob (sliderHp);
@@ -30,6 +33,7 @@ OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhase
     configurarKnob (sliderRisha);
     configurarKnob (sliderSaida);
 
+    addAndMakeVisible (medidorCorrelacao);
     addAndMakeVisible (medidorRisha);
     addAndMakeVisible (medidorSaida);
 
@@ -44,6 +48,7 @@ OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhase
 
     aplicarCoresComponentes();
     setSize (900, 336);
+    atualizarModoCanais (true);
     startTimerHz (30);
 }
 
@@ -55,15 +60,38 @@ OudBodyPhaseAudioProcessorEditor::~OudBodyPhaseAudioProcessorEditor()
 
 void OudBodyPhaseAudioProcessorEditor::timerCallback()
 {
+    atualizarModoCanais (false);
+
+    if (! modoMono)
+        medidorCorrelacao.atualizarLeitura (audioProcessor.lerCorrelacaoFase());
+
     medidorRisha.atualizarLeitura (audioProcessor.consumirReducaoRishaDb());
     medidorSaida.atualizarLeitura (audioProcessor.consumirPicoSaidaLinear());
+}
+
+void OudBodyPhaseAudioProcessorEditor::atualizarModoCanais (bool forcarLayout)
+{
+    const bool agoraMono = (audioProcessor.getNumCanaisAtivos() < 2);
+    if (! forcarLayout && agoraMono == modoMono)
+        return;
+
+    modoMono = agoraMono;
+    const bool exibirControlesEstereo = ! modoMono;
+
+    rotuloAlvoFase.setVisible (exibirControlesEstereo);
+    caixaAlvoFase.setVisible (exibirControlesEstereo);
+    caixaAlvoFase.setEnabled (exibirControlesEstereo);
+    medidorCorrelacao.setVisible (exibirControlesEstereo);
+
+    resized();
+    repaint();
 }
 
 void OudBodyPhaseAudioProcessorEditor::alternarTema()
 {
     const bool proximoClaro = ! oudLookAndFeel.estaTemaClaro();
     oudLookAndFeel.aplicarTema (proximoClaro);
-    botaoTema.setButtonText (proximoClaro ? "Ebano" : "Nahar");
+    botaoTema.setButtonText (proximoClaro ? juce::String::fromUTF8 ("\xc3\x89" "bano") : "Nahar");
     aplicarCoresComponentes();
     repaint();
 }
@@ -101,6 +129,7 @@ void OudBodyPhaseAudioProcessorEditor::aplicarCoresComponentes()
     atualizarSlider (sliderRisha);
     atualizarSlider (sliderSaida);
 
+    medidorCorrelacao.setTemaClaro (temaClaro);
     medidorRisha.setTemaClaro (temaClaro);
     medidorSaida.setTemaClaro (temaClaro);
 }
@@ -156,14 +185,12 @@ void OudBodyPhaseAudioProcessorEditor::paint (juce::Graphics& g)
 {
     const auto& pal = oudLookAndFeel.getPaleta();
 
-    // Fundo em gradiente sutil no mesmo espirito de --bg-page-grad
     juce::ColourGradient gradienteFundo (
         pal.fundoDeep.brighter (0.04f), 0.0f, 0.0f,
         pal.fundoDeep.darker (0.12f), 0.0f, static_cast<float> (getHeight()), false);
     g.setGradientFill (gradienteFundo);
     g.fillAll();
 
-    // Cartao de cabecalho estilo .studio-header
     if (! cartaoCabecalho.isEmpty())
     {
         const auto cabF = cartaoCabecalho.toFloat();
@@ -187,7 +214,7 @@ void OudBodyPhaseAudioProcessorEditor::paint (juce::Graphics& g)
     desenharCartaoSecao (g, painelFase,  "Fase & Alinhamento", pal.latao);
     desenharCartaoSecao (g, painelCaixa, "Corpo & Caixa",      pal.latao);
     desenharCartaoSecao (g, painelRisha, "Risha",              pal.ameixa);
-    desenharCartaoSecao (g, painelSaida, "Saida",              pal.latao);
+    desenharCartaoSecao (g, painelSaida, juce::String::fromUTF8 ("Sa" "\xc3\xad" "da"), pal.latao);
 }
 
 void OudBodyPhaseAudioProcessorEditor::resized()
@@ -206,9 +233,9 @@ void OudBodyPhaseAudioProcessorEditor::resized()
     const int gap = 10;
     const int larguraUtil = area.getWidth() - gap * 3;
 
-    const int wFase  = static_cast<int> (larguraUtil * 0.30f);
-    const int wCaixa = static_cast<int> (larguraUtil * 0.35f);
-    const int wRisha = static_cast<int> (larguraUtil * 0.175f);
+    const int wFase  = static_cast<int> (larguraUtil * 0.33f);
+    const int wCaixa = static_cast<int> (larguraUtil * 0.33f);
+    const int wRisha = static_cast<int> (larguraUtil * 0.17f);
     const int wSaida = std::max (120, larguraUtil - wFase - wCaixa - wRisha);
 
     painelFase  = area.removeFromLeft (wFase);
@@ -219,18 +246,29 @@ void OudBodyPhaseAudioProcessorEditor::resized()
     area.removeFromLeft (gap);
     painelSaida = area;
 
-    // 1. Fase & Alinhamento
+    // 1. Fase & Alinhamento (adaptativo para Mono vs Estereo)
     {
         auto inner = painelFase.reduced (10, 8);
         inner.removeFromTop (18);
 
-        auto linhaTopo = inner.removeFromTop (30);
-        botaoFase.setBounds (linhaTopo.removeFromLeft (142));
-        linhaTopo.removeFromLeft (6);
-        rotuloAlvoFase.setBounds (linhaTopo.removeFromLeft (30));
-        caixaAlvoFase.setBounds (linhaTopo);
+        auto linhaTopo = inner.removeFromTop (28);
+        if (modoMono)
+        {
+            botaoFase.setBounds (linhaTopo);
+        }
+        else
+        {
+            botaoFase.setBounds (linhaTopo.removeFromLeft (144));
+            linhaTopo.removeFromLeft (4);
+            rotuloAlvoFase.setBounds (linhaTopo.removeFromLeft (28));
+            caixaAlvoFase.setBounds (linhaTopo);
 
-        inner.removeFromTop (6);
+            auto areaCorrelacao = inner.removeFromBottom (26);
+            inner.removeFromBottom (4);
+            medidorCorrelacao.setBounds (areaCorrelacao.reduced (2, 0));
+        }
+
+        inner.removeFromTop (4);
         posicionarKnob (inner, rotuloAtraso, sliderAtraso);
     }
 

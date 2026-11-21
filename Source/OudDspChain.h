@@ -13,6 +13,13 @@ enum class AlvoCanalFase : int
     Canal2 = 2
 };
 
+enum class EstadoCorrelacao : int
+{
+    Silencio = 0,
+    Mono     = 1,
+    Ativo    = 2
+};
+
 struct ParametrosDspOud
 {
     bool inverterFase      = false;
@@ -25,10 +32,17 @@ struct ParametrosDspOud
     float ganhoSaidaDb     = 0.0f;
 };
 
+struct LeituraCorrelacaoOud
+{
+    float valor             = 0.0f; // -1.0 (fora de fase) a +1.0 (em fase)
+    EstadoCorrelacao estado = EstadoCorrelacao::Silencio;
+};
+
 struct LeituraMedidoresOud
 {
     float reducaoRishaDb  = 0.0f; // Valor positivo em dB (0.0 a ~12.0 dB)
     float picoSaidaLinear = 0.0f; // Amplitude linear (0.0 a >= 1.0)
+    LeituraCorrelacaoOud correlacao;
 };
 
 // Ponte lock-free (audio thread -> UI thread) que preserva picos curtos entre quadros do Timer
@@ -60,15 +74,134 @@ private:
     std::atomic<float> pico { 0.0f };
 };
 
+// Ponte lock-free para grandeza bipolar continua (-1.0 a +1.0) + estado (Silencio / Mono / Ativo)
+struct MedidorCorrelacaoAtomico
+{
+    void registrar (const LeituraCorrelacaoOud& leitura) noexcept
+    {
+        const float seguro = std::isfinite (leitura.valor)
+            ? juce::jlimit (-1.0f, 1.0f, leitura.valor)
+            : 0.0f;
+
+        valor.store (seguro, std::memory_order_relaxed);
+        estado.store (static_cast<int> (leitura.estado), std::memory_order_release);
+    }
+
+    LeituraCorrelacaoOud ler() const noexcept
+    {
+        LeituraCorrelacaoOud out;
+        out.estado = static_cast<EstadoCorrelacao> (estado.load (std::memory_order_acquire));
+        out.valor  = valor.load (std::memory_order_relaxed);
+        return out;
+    }
+
+    void reset() noexcept
+    {
+        valor.store (0.0f, std::memory_order_relaxed);
+        estado.store (static_cast<int> (EstadoCorrelacao::Silencio), std::memory_order_release);
+    }
+
+private:
+    std::atomic<float> valor  { 0.0f };
+    std::atomic<int>   estado { static_cast<int> (EstadoCorrelacao::Silencio) };
+};
+
+class AnalisadorCorrelacaoFase
+{
+public:
+    void prepare (double sampleRate) noexcept
+    {
+        taxaAmostragem = std::max (1.0, sampleRate);
+        reset();
+    }
+
+    void reset() noexcept
+    {
+        emaLL = 0.0;
+        emaRR = 0.0;
+        emaLR = 0.0;
+    }
+
+    LeituraCorrelacaoOud processar (const juce::AudioBuffer<float>& buffer) noexcept
+    {
+        LeituraCorrelacaoOud leitura;
+        const int numCanais   = buffer.getNumChannels();
+        const int numAmostras = buffer.getNumSamples();
+
+        if (numCanais < 2)
+        {
+            leitura.estado = EstadoCorrelacao::Mono;
+            leitura.valor  = 0.0f;
+            return leitura;
+        }
+
+        if (numAmostras <= 0)
+            return leitura;
+
+        const float* ch0 = buffer.getReadPointer (0);
+        const float* ch1 = buffer.getReadPointer (1);
+
+        double sumLL = 0.0;
+        double sumRR = 0.0;
+        double sumLR = 0.0;
+
+        for (int n = 0; n < numAmostras; ++n)
+        {
+            const double l = static_cast<double> (ch0[n]);
+            const double r = static_cast<double> (ch1[n]);
+            sumLL += l * l;
+            sumRR += r * r;
+            sumLR += l * r;
+        }
+
+        const double invN   = 1.0 / static_cast<double> (numAmostras);
+        const double meanLL = sumLL * invN;
+        const double meanRR = sumRR * invN;
+        const double meanLR = sumLR * invN;
+
+        // Integracao exponencial ~120 ms independente do tamanho de bloco
+        const double alpha = std::exp (-static_cast<double> (numAmostras) / (0.120 * taxaAmostragem));
+        const double umMenosAlpha = 1.0 - alpha;
+
+        emaLL = alpha * emaLL + umMenosAlpha * meanLL;
+        emaRR = alpha * emaRR + umMenosAlpha * meanRR;
+        emaLR = alpha * emaLR + umMenosAlpha * meanLR;
+
+        const double denom = std::sqrt (std::max (0.0, emaLL * emaRR));
+
+        // Limiar aproximado de -90 dBFS RMS para responder a passagens suaves do Oud
+        if (denom > 1.0e-9)
+        {
+            leitura.estado = EstadoCorrelacao::Ativo;
+            leitura.valor  = juce::jlimit (-1.0f, 1.0f, static_cast<float> (emaLR / denom));
+        }
+        else
+        {
+            leitura.estado = EstadoCorrelacao::Silencio;
+            leitura.valor  = 0.0f;
+        }
+
+        return leitura;
+    }
+
+private:
+    double taxaAmostragem = 48000.0;
+    double emaLL = 0.0;
+    double emaRR = 0.0;
+    double emaLR = 0.0;
+};
+
 class AlinhadorFase
 {
 public:
+    static constexpr int latenciaBaseAmostras = 2;
+
     void prepare (const juce::dsp::ProcessSpec& spec)
     {
         taxaAmostragem = std::max (1.0, spec.sampleRate);
-        maxAmostrasAtraso = static_cast<int> (std::ceil (0.025 * taxaAmostragem)) + 4;
+        maxAmostrasAtraso = static_cast<int> (std::ceil (0.025 * taxaAmostragem)) + 16;
 
-        linhaAtraso = juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> (maxAmostrasAtraso);
+        linhaAtraso = juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> (maxAmostrasAtraso);
         linhaAtraso.prepare (spec);
 
         atrasoAmostrasSuave.reset (taxaAmostragem, 0.030);
@@ -86,9 +219,10 @@ public:
     void atualizar (bool inverter, float atrasoMs, AlvoCanalFase alvo)
     {
         alvoAtual = alvo;
+        const float maxUtil = static_cast<float> (maxAmostrasAtraso - latenciaBaseAmostras - 4);
         const float amostras = juce::jlimit (
             0.0f,
-            static_cast<float> (maxAmostrasAtraso - 2),
+            maxUtil,
             (atrasoMs * 0.001f) * static_cast<float> (taxaAmostragem));
 
         atrasoAmostrasSuave.setTargetValue (amostras);
@@ -99,6 +233,7 @@ public:
     {
         const int numCanais   = buffer.getNumChannels();
         const int numAmostras = buffer.getNumSamples();
+        const float baseAmostras = static_cast<float> (latenciaBaseAmostras);
 
         for (int n = 0; n < numAmostras; ++n)
         {
@@ -112,19 +247,20 @@ public:
                 linhaAtraso.pushSample (ch, entrada);
 
                 const bool aplicarNoCanal =
-                    (alvoAtual == AlvoCanalFase::Ambos)
+                    (numCanais == 1)
+                    || (alvoAtual == AlvoCanalFase::Ambos)
                     || (alvoAtual == AlvoCanalFase::Canal1 && ch == 0)
                     || (alvoAtual == AlvoCanalFase::Canal2 && ch == 1);
 
                 if (aplicarNoCanal)
                 {
-                    const float atrasada = linhaAtraso.popSample (ch, atrasoAtual);
+                    const float atrasada = linhaAtraso.popSample (ch, baseAmostras + atrasoAtual);
                     dados[n] = atrasada * polAtual;
                 }
                 else
                 {
-                    // Mantem o buffer da linha coerente caso o alvo mude durante a reproducao
-                    (void) linhaAtraso.popSample (ch, 0.0f);
+                    // Mesmo offset base mantem atraso relativo exato de 0 ms com Lagrange3rd estavel
+                    dados[n] = linhaAtraso.popSample (ch, baseAmostras);
                 }
             }
         }
@@ -135,7 +271,7 @@ private:
     int maxAmostrasAtraso = 2048;
     AlvoCanalFase alvoAtual = AlvoCanalFase::Ambos;
 
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> linhaAtraso { 2048 };
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> linhaAtraso { 2048 };
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> atrasoAmostrasSuave;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> polaridadeSuave;
 };
@@ -376,9 +512,12 @@ private:
 class CadeiaDspOud
 {
 public:
+    static constexpr int getLatenciaAmostras() noexcept { return AlinhadorFase::latenciaBaseAmostras; }
+
     void prepare (const juce::dsp::ProcessSpec& spec)
     {
         alinhadorFase.prepare (spec);
+        analisadorCorrelacao.prepare (spec.sampleRate);
         escultorCaixa.prepare (spec);
         modeladorRisha.prepare (spec);
 
@@ -389,6 +528,7 @@ public:
     void reset()
     {
         alinhadorFase.reset();
+        analisadorCorrelacao.reset();
         escultorCaixa.reset();
         modeladorRisha.reset();
         ganhoSaidaSuave.setCurrentAndTargetValue (ganhoSaidaSuave.getTargetValue());
@@ -407,6 +547,10 @@ public:
         LeituraMedidoresOud leitura;
 
         alinhadorFase.process (buffer);
+
+        // Mede a correlacao logo apos o alinhamento de fase/atraso
+        leitura.correlacao = analisadorCorrelacao.processar (buffer);
+
         escultorCaixa.process (buffer);
         leitura.reducaoRishaDb = modeladorRisha.process (buffer);
 
@@ -426,6 +570,7 @@ public:
 
 private:
     AlinhadorFase alinhadorFase;
+    AnalisadorCorrelacaoFase analisadorCorrelacao;
     EscultorCaixa escultorCaixa;
     ModeladorRisha modeladorRisha;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> ganhoSaidaSuave;
