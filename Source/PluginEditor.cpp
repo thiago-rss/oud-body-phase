@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include <algorithm>
 
 OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhaseAudioProcessor& p)
     : AudioProcessorEditor (&p), audioProcessor (p)
@@ -29,6 +30,9 @@ OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhase
     configurarKnob (sliderRisha);
     configurarKnob (sliderSaida);
 
+    addAndMakeVisible (medidorRisha);
+    addAndMakeVisible (medidorSaida);
+
     attachFase       = std::make_unique<ButtonAttachment>   (audioProcessor.apvts, OudParamIDs::inverterFase,  botaoFase);
     attachAlvoFase   = std::make_unique<ComboBoxAttachment> (audioProcessor.apvts, OudParamIDs::alvoFase,      caixaAlvoFase);
     attachAtraso     = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::atrasoFinoMs,  sliderAtraso);
@@ -39,12 +43,20 @@ OudBodyPhaseAudioProcessorEditor::OudBodyPhaseAudioProcessorEditor (OudBodyPhase
     attachSaida      = std::make_unique<SliderAttachment>   (audioProcessor.apvts, OudParamIDs::ganhoSaidaDb,  sliderSaida);
 
     aplicarCoresComponentes();
-    setSize (800, 336);
+    setSize (900, 336);
+    startTimerHz (30);
 }
 
 OudBodyPhaseAudioProcessorEditor::~OudBodyPhaseAudioProcessorEditor()
 {
+    stopTimer();
     setLookAndFeel (nullptr);
+}
+
+void OudBodyPhaseAudioProcessorEditor::timerCallback()
+{
+    medidorRisha.atualizarLeitura (audioProcessor.consumirReducaoRishaDb());
+    medidorSaida.atualizarLeitura (audioProcessor.consumirPicoSaidaLinear());
 }
 
 void OudBodyPhaseAudioProcessorEditor::alternarTema()
@@ -59,6 +71,7 @@ void OudBodyPhaseAudioProcessorEditor::alternarTema()
 void OudBodyPhaseAudioProcessorEditor::aplicarCoresComponentes()
 {
     const auto& pal = oudLookAndFeel.getPaleta();
+    const bool temaClaro = oudLookAndFeel.estaTemaClaro();
 
     auto atualizarLabel = [&] (juce::Label& lbl, bool destaque = false)
     {
@@ -87,6 +100,9 @@ void OudBodyPhaseAudioProcessorEditor::aplicarCoresComponentes()
     atualizarSlider (sliderCaixaGanho);
     atualizarSlider (sliderRisha);
     atualizarSlider (sliderSaida);
+
+    medidorRisha.setTemaClaro (temaClaro);
+    medidorSaida.setTemaClaro (temaClaro);
 }
 
 void OudBodyPhaseAudioProcessorEditor::configurarRotulo (juce::Label& rotulo, const juce::String& texto)
@@ -128,8 +144,8 @@ void OudBodyPhaseAudioProcessorEditor::desenharCartaoSecao (juce::Graphics& g,
 }
 
 void OudBodyPhaseAudioProcessorEditor::posicionarKnob (juce::Rectangle<int> coluna,
-                                                     juce::Label& rotulo,
-                                                     juce::Slider& knob)
+                                                       juce::Label& rotulo,
+                                                       juce::Slider& knob)
 {
     auto conteudo = coluna.reduced (4, 2);
     rotulo.setBounds (conteudo.removeFromTop (18));
@@ -157,8 +173,7 @@ void OudBodyPhaseAudioProcessorEditor::paint (juce::Graphics& g)
         g.drawRoundedRectangle (cabF, 14.0f, 1.0f);
 
         auto interno = cartaoCabecalho.reduced (14, 6);
-        auto direita = interno.removeFromRight (88);
-        botaoTema.setBounds (direita.withSizeKeepingCentre (76, 28));
+        interno.removeFromRight (88);
 
         g.setColour (pal.textoPrincipal);
         g.setFont (oudLookAndFeel.getFonteTitulo (22.0f));
@@ -180,15 +195,21 @@ void OudBodyPhaseAudioProcessorEditor::resized()
     auto area = getLocalBounds().reduced (14, 12);
 
     cartaoCabecalho = area.removeFromTop (46);
+    {
+        auto internoCab = cartaoCabecalho.reduced (14, 6);
+        auto direitaCab = internoCab.removeFromRight (88);
+        botaoTema.setBounds (direitaCab.withSizeKeepingCentre (76, 28));
+    }
+
     area.removeFromTop (10);
 
     const int gap = 10;
-    const int larguraTotal = area.getWidth();
+    const int larguraUtil = area.getWidth() - gap * 3;
 
-    const int wFase  = static_cast<int> (larguraTotal * 0.30f);
-    const int wCaixa = static_cast<int> (larguraTotal * 0.38f);
-    const int wRisha = static_cast<int> (larguraTotal * 0.16f);
-    const int wSaida = std::max (84, larguraTotal - wFase - wCaixa - wRisha - gap * 3);
+    const int wFase  = static_cast<int> (larguraUtil * 0.30f);
+    const int wCaixa = static_cast<int> (larguraUtil * 0.35f);
+    const int wRisha = static_cast<int> (larguraUtil * 0.175f);
+    const int wSaida = std::max (120, larguraUtil - wFase - wCaixa - wRisha);
 
     painelFase  = area.removeFromLeft (wFase);
     area.removeFromLeft (gap);
@@ -205,7 +226,7 @@ void OudBodyPhaseAudioProcessorEditor::resized()
 
         auto linhaTopo = inner.removeFromTop (30);
         botaoFase.setBounds (linhaTopo.removeFromLeft (142));
-        linhaTopo.removeFromLeft (8);
+        linhaTopo.removeFromLeft (6);
         rotuloAlvoFase.setBounds (linhaTopo.removeFromLeft (30));
         caixaAlvoFase.setBounds (linhaTopo);
 
@@ -221,20 +242,28 @@ void OudBodyPhaseAudioProcessorEditor::resized()
         const int wCol = inner.getWidth() / 3;
         posicionarKnob (inner.removeFromLeft (wCol), rotuloHp,         sliderHp);
         posicionarKnob (inner.removeFromLeft (wCol), rotuloCaixaFreq,  sliderCaixaFreq);
-        posicionarKnob (inner,                        rotuloCaixaGanho, sliderCaixaGanho);
+        posicionarKnob (inner,                       rotuloCaixaGanho, sliderCaixaGanho);
     }
 
-    // 3. Risha
+    // 3. Risha + Medidor de Reducao (GR)
     {
         auto inner = painelRisha.reduced (10, 8);
         inner.removeFromTop (18);
+
+        auto areaMedidor = inner.removeFromRight (26);
+        inner.removeFromRight (6);
+        medidorRisha.setBounds (areaMedidor.reduced (0, 4));
         posicionarKnob (inner, rotuloRisha, sliderRisha);
     }
 
-    // 4. Saida
+    // 4. Saida + Medidor de Pico (dBFS + Clip)
     {
         auto inner = painelSaida.reduced (10, 8);
         inner.removeFromTop (18);
+
+        auto areaMedidor = inner.removeFromRight (26);
+        inner.removeFromRight (6);
+        medidorSaida.setBounds (areaMedidor.reduced (0, 4));
         posicionarKnob (inner, rotuloSaida, sliderSaida);
     }
 }

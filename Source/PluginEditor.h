@@ -3,8 +3,10 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PluginProcessor.h"
 #include "OudLookAndFeel.h"
+#include "OudMeters.h"
 
-class OudBodyPhaseAudioProcessorEditor : public juce::AudioProcessorEditor
+class OudBodyPhaseAudioProcessorEditor : public juce::AudioProcessorEditor,
+                                         private juce::Timer
 {
 public:
     explicit OudBodyPhaseAudioProcessorEditor (OudBodyPhaseAudioProcessor&);
@@ -34,13 +36,15 @@ private:
     juce::Label rotuloCaixaGanho;
     juce::Slider sliderCaixaGanho;
 
-    // Controle de Risha
+    // Controle e Medidor de Risha
     juce::Label rotuloRisha;
     juce::Slider sliderRisha;
+    MedidorReducaoRisha medidorRisha;
 
-    // Controle de Saida
+    // Controle e Medidor de Saida
     juce::Label rotuloSaida;
     juce::Slider sliderSaida;
+    MedidorPicoSaida medidorSaida;
 
     using SliderAttachment   = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAttachment   = juce::AudioProcessorValueTreeState::ButtonAttachment;
@@ -61,14 +65,15 @@ private:
     juce::Rectangle<int> painelRisha;
     juce::Rectangle<int> painelSaida;
 
+    void timerCallback() override;
     void alternarTema();
     void aplicarCoresComponentes();
     void configurarRotulo (juce::Label& rotulo, const juce::String& texto);
     void configurarKnob (juce::Slider& slider);
     void desenharCartaoSecao (juce::Graphics& g,
-                               juce::Rectangle<int> area,
-                               const juce::String& titulo,
-                               juce::Colour corTitulo);
+                              juce::Rectangle<int> area,
+                              const juce::String& titulo,
+                              juce::Colour corTitulo);
     void posicionarKnob (juce::Rectangle<int> coluna, juce::Label& rotulo, juce::Slider& knob);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OudBodyPhaseAudioProcessorEditor)

@@ -39,8 +39,13 @@ public:
 
     juce::AudioProcessorValueTreeState apvts;
 
+    float consumirReducaoRishaDb() noexcept  { return medidorReducaoRisha.consumirPico(); }
+    float consumirPicoSaidaLinear() noexcept { return medidorPicoSaida.consumirPico(); }
+
 private:
     CadeiaDspOud cadeiaDsp;
+    MedidorAtomico medidorReducaoRisha;
+    MedidorAtomico medidorPicoSaida;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OudBodyPhaseAudioProcessor)
 };

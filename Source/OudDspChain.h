@@ -2,6 +2,7 @@
 
 #include <juce_dsp/juce_dsp.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -14,88 +15,129 @@ enum class AlvoCanalFase : int
 
 struct ParametrosDspOud
 {
-    bool          inverterFase  { false };
-    float         atrasoFinoMs  { 0.0f };
-    AlvoCanalFase alvoFase      { AlvoCanalFase::Ambos };
-    float         freqCorteHpHz { 80.0f };
-    float         freqCaixaHz   { 240.0f };
-    float         ganhoCaixaDb  { 0.0f };
-    float         suavizarRisha { 0.0f };
-    float         ganhoSaidaDb  { 0.0f };
+    bool inverterFase      = false;
+    float atrasoFinoMs     = 0.0f;
+    AlvoCanalFase alvoFase = AlvoCanalFase::Ambos;
+    float freqCorteHpHz    = 80.0f;
+    float freqCaixaHz      = 240.0f;
+    float ganhoCaixaDb     = 0.0f;
+    float suavizarRisha    = 0.0f;
+    float ganhoSaidaDb     = 0.0f;
+};
+
+struct LeituraMedidoresOud
+{
+    float reducaoRishaDb  = 0.0f; // Valor positivo em dB (0.0 a ~12.0 dB)
+    float picoSaidaLinear = 0.0f; // Amplitude linear (0.0 a >= 1.0)
+};
+
+// Ponte lock-free (audio thread -> UI thread) que preserva picos curtos entre quadros do Timer
+struct MedidorAtomico
+{
+    void registrarPico (float novoValor) noexcept
+    {
+        if (! std::isfinite (novoValor) || novoValor <= 0.0f)
+            return;
+
+        float atual = pico.load (std::memory_order_relaxed);
+        while (novoValor > atual
+               && ! pico.compare_exchange_weak (atual, novoValor, std::memory_order_relaxed))
+        {
+        }
+    }
+
+    float consumirPico() noexcept
+    {
+        return pico.exchange (0.0f, std::memory_order_relaxed);
+    }
+
+    void reset() noexcept
+    {
+        pico.store (0.0f, std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<float> pico { 0.0f };
 };
 
 class AlinhadorFase
 {
 public:
-    static constexpr float atrasoMaximoMs { 25.0f };
-
     void prepare (const juce::dsp::ProcessSpec& spec)
     {
-        taxaAmostragem = spec.sampleRate;
-        const int maxAmostras = static_cast<int> (std::ceil (taxaAmostragem * (atrasoMaximoMs * 0.001))) + 4;
+        taxaAmostragem = std::max (1.0, spec.sampleRate);
+        maxAmostrasAtraso = static_cast<int> (std::ceil (0.025 * taxaAmostragem)) + 4;
 
-        linhaAtraso.setMaximumDelayInSamples (maxAmostras);
+        linhaAtraso = juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> (maxAmostrasAtraso);
         linhaAtraso.prepare (spec);
 
-        atrasoSuavizado.reset (taxaAmostragem, 0.03);
-        polaridadeSuavizada.reset (taxaAmostragem, 0.015);
-
-        atrasoSuavizado.setCurrentAndTargetValue (0.0f);
-        polaridadeSuavizada.setCurrentAndTargetValue (1.0f);
+        atrasoAmostrasSuave.reset (taxaAmostragem, 0.030);
+        polaridadeSuave.reset (taxaAmostragem, 0.015);
+        reset();
     }
 
     void reset()
     {
         linhaAtraso.reset();
-        atrasoSuavizado.setCurrentAndTargetValue (atrasoSuavizado.getTargetValue());
-        polaridadeSuavizada.setCurrentAndTargetValue (polaridadeSuavizada.getTargetValue());
+        atrasoAmostrasSuave.setCurrentAndTargetValue (0.0f);
+        polaridadeSuave.setCurrentAndTargetValue (1.0f);
     }
 
-    void definirAlvos (float atrasoMs, bool inverter, AlvoCanalFase alvo)
+    void atualizar (bool inverter, float atrasoMs, AlvoCanalFase alvo)
     {
-        const float limitadoMs = juce::jlimit (0.0f, atrasoMaximoMs, atrasoMs);
-        const float alvoAmostras = static_cast<float> (limitadoMs * 0.001 * taxaAmostragem);
-        atrasoSuavizado.setTargetValue (alvoAmostras);
-        polaridadeSuavizada.setTargetValue (inverter ? -1.0f : 1.0f);
-        alvoCanal = alvo;
+        alvoAtual = alvo;
+        const float amostras = juce::jlimit (
+            0.0f,
+            static_cast<float> (maxAmostrasAtraso - 2),
+            (atrasoMs * 0.001f) * static_cast<float> (taxaAmostragem));
+
+        atrasoAmostrasSuave.setTargetValue (amostras);
+        polaridadeSuave.setTargetValue (inverter ? -1.0f : 1.0f);
     }
 
-    bool canalEstaAtivo (int canal) const noexcept
+    void process (juce::AudioBuffer<float>& buffer)
     {
-        switch (alvoCanal)
-        {
-            case AlvoCanalFase::Ambos:  return true;
-            case AlvoCanalFase::Canal1: return canal == 0;
-            case AlvoCanalFase::Canal2: return canal == 1;
-        }
-        return true;
-    }
+        const int numCanais   = buffer.getNumChannels();
+        const int numAmostras = buffer.getNumSamples();
 
-    void processarAmostra (int canal, float& amostra) noexcept
-    {
-        const float atrasoAtual = atrasoSuavizado.getNextValue();
-        const float polaridade  = polaridadeSuavizada.getNextValue();
-
-        linhaAtraso.pushSample (canal, amostra);
-
-        if (canalEstaAtivo (canal))
+        for (int n = 0; n < numAmostras; ++n)
         {
-            const float atrasada = linhaAtraso.popSample (canal, atrasoAtual, true);
-            amostra = atrasada * polaridade;
-        }
-        else
-        {
-            // Mantem a linha de atraso alimentada com atraso zero no canal nao selecionado
-            (void) linhaAtraso.popSample (canal, 0.0f, false);
+            const float atrasoAtual = atrasoAmostrasSuave.getNextValue();
+            const float polAtual    = polaridadeSuave.getNextValue();
+
+            for (int ch = 0; ch < numCanais; ++ch)
+            {
+                auto* dados = buffer.getWritePointer (ch);
+                const float entrada = dados[n];
+                linhaAtraso.pushSample (ch, entrada);
+
+                const bool aplicarNoCanal =
+                    (alvoAtual == AlvoCanalFase::Ambos)
+                    || (alvoAtual == AlvoCanalFase::Canal1 && ch == 0)
+                    || (alvoAtual == AlvoCanalFase::Canal2 && ch == 1);
+
+                if (aplicarNoCanal)
+                {
+                    const float atrasada = linhaAtraso.popSample (ch, atrasoAtual);
+                    dados[n] = atrasada * polAtual;
+                }
+                else
+                {
+                    // Mantem o buffer da linha coerente caso o alvo mude durante a reproducao
+                    (void) linhaAtraso.popSample (ch, 0.0f);
+                }
+            }
         }
     }
 
 private:
-    double taxaAmostragem { 48000.0 };
-    AlvoCanalFase alvoCanal { AlvoCanalFase::Ambos };
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> linhaAtraso;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> atrasoSuavizado;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> polaridadeSuavizada;
+    double taxaAmostragem = 48000.0;
+    int maxAmostrasAtraso = 2048;
+    AlvoCanalFase alvoAtual = AlvoCanalFase::Ambos;
+
+    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> linhaAtraso { 2048 };
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> atrasoAmostrasSuave;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> polaridadeSuave;
 };
 
 class EscultorCaixa
@@ -103,19 +145,19 @@ class EscultorCaixa
 public:
     void prepare (const juce::dsp::ProcessSpec& spec)
     {
-        taxaAmostragem = spec.sampleRate;
-        const size_t numCanais = static_cast<size_t> (std::max<juce::uint32> (1, spec.numChannels));
+        taxaAmostragem = std::max (1.0, spec.sampleRate);
+        const size_t canais = std::max<size_t> (1, spec.numChannels);
 
-        filtrosHp.resize (numCanais);
-        filtrosCaixa.resize (numCanais);
+        filtrosHp.assign (canais, Biquad {});
+        filtrosCaixa.assign (canais, Biquad {});
 
-        hpSuavizado.reset (taxaAmostragem, 0.025);
-        freqCaixaSuavizada.reset (taxaAmostragem, 0.025);
-        ganhoCaixaSuavizado.reset (taxaAmostragem, 0.025);
+        freqHpSuave.reset (taxaAmostragem, 0.025);
+        freqCaixaSuave.reset (taxaAmostragem, 0.025);
+        ganhoCaixaSuave.reset (taxaAmostragem, 0.025);
 
-        hpSuavizado.setCurrentAndTargetValue (80.0f);
-        freqCaixaSuavizada.setCurrentAndTargetValue (240.0f);
-        ganhoCaixaSuavizado.setCurrentAndTargetValue (0.0f);
+        freqHpSuave.setCurrentAndTargetValue (80.0f);
+        freqCaixaSuave.setCurrentAndTargetValue (240.0f);
+        ganhoCaixaSuave.setCurrentAndTargetValue (0.0f);
 
         atualizarCoeficientes (80.0f, 240.0f, 0.0f);
         reset();
@@ -123,64 +165,110 @@ public:
 
     void reset()
     {
-        for (auto& f : filtrosHp) f.reset();
+        for (auto& f : filtrosHp)    f.reset();
         for (auto& f : filtrosCaixa) f.reset();
     }
 
-    void definirAlvos (float hpHz, float caixaHz, float ganhoDb)
+    void atualizar (float freqHpHz, float freqCaixaHz, float ganhoCaixaDb)
     {
-        hpSuavizado.setTargetValue (juce::jlimit (20.0f, 500.0f, hpHz));
-        freqCaixaSuavizada.setTargetValue (juce::jlimit (80.0f, 1200.0f, caixaHz));
-        ganhoCaixaSuavizado.setTargetValue (juce::jlimit (-24.0f, 18.0f, ganhoDb));
+        freqHpSuave.setTargetValue (juce::jlimit (20.0f, 400.0f, freqHpHz));
+        freqCaixaSuave.setTargetValue (juce::jlimit (100.0f, 800.0f, freqCaixaHz));
+        ganhoCaixaSuave.setTargetValue (juce::jlimit (-18.0f, 12.0f, ganhoCaixaDb));
     }
 
-    // Recalcula os coeficientes IIR uma vez por bloco, avancando os suavizadores pelo tamanho do bloco
-    void atualizarPorBloco (int numAmostras) noexcept
+    void process (juce::AudioBuffer<float>& buffer)
     {
-        const int passos = std::max (1, numAmostras);
+        const int numCanais   = buffer.getNumChannels();
+        const int numAmostras = buffer.getNumSamples();
 
-        float hp    = hpSuavizado.getCurrentValue();
-        float freq  = freqCaixaSuavizada.getCurrentValue();
-        float ganho = ganhoCaixaSuavizado.getCurrentValue();
+        if (numAmostras <= 0)
+            return;
 
-        if (hpSuavizado.isSmoothing())
-            hp = hpSuavizado.skip (passos);
+        // Atualiza os coeficientes IIR uma unica vez por bloco
+        const float hpBloco    = freqHpSuave.skip (numAmostras);
+        const float caixaBloco = freqCaixaSuave.skip (numAmostras);
+        const float ganhoBloco = ganhoCaixaSuave.skip (numAmostras);
+        atualizarCoeficientes (hpBloco, caixaBloco, ganhoBloco);
 
-        if (freqCaixaSuavizada.isSmoothing())
-            freq = freqCaixaSuavizada.skip (passos);
+        for (int ch = 0; ch < numCanais && ch < static_cast<int> (filtrosHp.size()); ++ch)
+        {
+            auto* dados = buffer.getWritePointer (ch);
+            auto& hp    = filtrosHp[static_cast<size_t> (ch)];
+            auto& caixa = filtrosCaixa[static_cast<size_t> (ch)];
 
-        if (ganhoCaixaSuavizado.isSmoothing())
-            ganho = ganhoCaixaSuavizado.skip (passos);
-
-        atualizarCoeficientes (hp, freq, ganho);
-    }
-
-    float processarAmostraCanal (size_t canal, float amostra) noexcept
-    {
-        float y = filtrosHp[canal].processSample (amostra);
-        y = filtrosCaixa[canal].processSample (y);
-        return y;
+            for (int n = 0; n < numAmostras; ++n)
+            {
+                const float aposHp = hp.processar (dados[n]);
+                dados[n] = caixa.processar (aposHp);
+            }
+        }
     }
 
 private:
-    void atualizarCoeficientes (float hpHz, float caixaHz, float ganhoDb) noexcept
+    struct Biquad
     {
-        auto coeffsHp = juce::dsp::IIR::Coefficients<float>::makeHighPass (taxaAmostragem, hpHz, 0.707f);
-        const float q = 2.2f;
-        auto coeffsCaixa = juce::dsp::IIR::Coefficients<float>::makePeakFilter (
-            taxaAmostragem, caixaHz, q, juce::Decibels::decibelsToGain (ganhoDb));
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0;
+        double a1 = 0.0, a2 = 0.0;
+        double z1 = 0.0, z2 = 0.0;
 
-        for (auto& f : filtrosHp) *f.coefficients = *coeffsHp;
-        for (auto& f : filtrosCaixa) *f.coefficients = *coeffsCaixa;
+        void reset() noexcept { z1 = 0.0; z2 = 0.0; }
+
+        void definirHighPass (double sr, double freq, double q) noexcept
+        {
+            const double w0    = juce::MathConstants<double>::twoPi * (freq / sr);
+            const double cosW0 = std::cos (w0);
+            const double alpha = std::sin (w0) / (2.0 * q);
+            const double invA0 = 1.0 / (1.0 + alpha);
+
+            b0 = ((1.0 + cosW0) * 0.5) * invA0;
+            b1 = (-(1.0 + cosW0)) * invA0;
+            b2 = ((1.0 + cosW0) * 0.5) * invA0;
+            a1 = (-2.0 * cosW0) * invA0;
+            a2 = (1.0 - alpha) * invA0;
+        }
+
+        void definirPeak (double sr, double freq, double q, double ganhoDb) noexcept
+        {
+            const double a     = std::pow (10.0, ganhoDb / 40.0);
+            const double w0    = juce::MathConstants<double>::twoPi * (freq / sr);
+            const double cosW0 = std::cos (w0);
+            const double alpha = std::sin (w0) / (2.0 * q);
+            const double invA0 = 1.0 / (1.0 + alpha / a);
+
+            b0 = (1.0 + alpha * a) * invA0;
+            b1 = (-2.0 * cosW0) * invA0;
+            b2 = (1.0 - alpha * a) * invA0;
+            a1 = (-2.0 * cosW0) * invA0;
+            a2 = (1.0 - alpha / a) * invA0;
+        }
+
+        float processar (float x) noexcept
+        {
+            const double xd = static_cast<double> (x);
+            const double y  = b0 * xd + z1;
+            z1 = b1 * xd - a1 * y + z2;
+            z2 = b2 * xd - a2 * y;
+            return static_cast<float> (y);
+        }
+    };
+
+    void atualizarCoeficientes (float freqHp, float freqCaixa, float ganhoDb) noexcept
+    {
+        const double maxFreq = taxaAmostragem * 0.45;
+        const double hp      = juce::jlimit (20.0, maxFreq, static_cast<double> (freqHp));
+        const double cx      = juce::jlimit (80.0, maxFreq, static_cast<double> (freqCaixa));
+
+        for (auto& f : filtrosHp)    f.definirHighPass (taxaAmostragem, hp, 0.70710678);
+        for (auto& f : filtrosCaixa) f.definirPeak (taxaAmostragem, cx, 2.2, static_cast<double> (ganhoDb));
     }
 
-    double taxaAmostragem { 48000.0 };
-    std::vector<juce::dsp::IIR::Filter<float>> filtrosHp;
-    std::vector<juce::dsp::IIR::Filter<float>> filtrosCaixa;
+    double taxaAmostragem = 48000.0;
+    std::vector<Biquad> filtrosHp;
+    std::vector<Biquad> filtrosCaixa;
 
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> hpSuavizado;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> freqCaixaSuavizada;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> ganhoCaixaSuavizado;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> freqHpSuave;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> freqCaixaSuave;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> ganhoCaixaSuave;
 };
 
 class ModeladorRisha
@@ -188,74 +276,101 @@ class ModeladorRisha
 public:
     void prepare (const juce::dsp::ProcessSpec& spec)
     {
-        taxaAmostragem = spec.sampleRate;
-        const size_t numCanais = static_cast<size_t> (std::max<juce::uint32> (1, spec.numChannels));
+        taxaAmostragem = std::max (1.0, spec.sampleRate);
+        const size_t canais = std::max<size_t> (1, spec.numChannels);
 
-        envRapido.assign (numCanais, 0.0f);
-        envLento.assign (numCanais, 0.0f);
+        envRapido.assign (canais, 0.0f);
+        envLento.assign (canais, 0.0f);
+        ganhoSuaveCanal.assign (canais, 1.0f);
 
-        ataqueRapidoCoeff  = coeffDeMs (0.5f);
-        solturaRapidaCoeff = coeffDeMs (8.0f);
-        ataqueLentoCoeff   = coeffDeMs (6.0f);
-        solturaLentaCoeff  = coeffDeMs (35.0f);
+        coeffAtaqueRapido  = calcularCoeficiente (0.0005); // 0.5 ms
+        coeffSolturaRapida = calcularCoeficiente (0.0080); // 8 ms
+        coeffAtaqueLento   = calcularCoeficiente (0.0060); // 6 ms
+        coeffSolturaLenta  = calcularCoeficiente (0.0350); // 35 ms
+        coeffGanho         = calcularCoeficiente (0.0020); // 2 ms
 
-        suavizarSuavizado.reset (taxaAmostragem, 0.02);
-        suavizarSuavizado.setCurrentAndTargetValue (0.0f);
+        intensidadeSuave.reset (taxaAmostragem, 0.020);
+        intensidadeSuave.setCurrentAndTargetValue (0.0f);
+        reset();
     }
 
     void reset()
     {
         std::fill (envRapido.begin(), envRapido.end(), 0.0f);
         std::fill (envLento.begin(), envLento.end(), 0.0f);
-        suavizarSuavizado.setCurrentAndTargetValue (suavizarSuavizado.getTargetValue());
+        std::fill (ganhoSuaveCanal.begin(), ganhoSuaveCanal.end(), 1.0f);
     }
 
-    void definirAlvoPorcentagem (float porcentagem)
+    void atualizar (float suavizarPorcento)
     {
-        suavizarSuavizado.setTargetValue (juce::jlimit (0.0f, 1.0f, porcentagem * 0.01f));
+        intensidadeSuave.setTargetValue (juce::jlimit (0.0f, 1.0f, suavizarPorcento * 0.01f));
     }
 
-    float processarAmostraCanal (size_t canal, float amostra) noexcept
+    // Retorna a maior reducao de ganho aplicada no bloco (em dB positivos, 0.0 a ~12.0 dB)
+    float process (juce::AudioBuffer<float>& buffer)
     {
-        const float qtdSuavizar = suavizarSuavizado.getNextValue();
-        const float absAmostra  = std::abs (amostra);
+        const int numCanais   = buffer.getNumChannels();
+        const int numAmostras = buffer.getNumSamples();
+        float menorGanhoBloco = 1.0f;
 
-        const float cRapido = (absAmostra > envRapido[canal]) ? ataqueRapidoCoeff : solturaRapidaCoeff;
-        envRapido[canal] = absAmostra + cRapido * (envRapido[canal] - absAmostra);
+        for (int n = 0; n < numAmostras; ++n)
+        {
+            const float intensidade = intensidadeSuave.getNextValue();
 
-        const float cLento = (absAmostra > envLento[canal]) ? ataqueLentoCoeff : solturaLentaCoeff;
-        envLento[canal] = absAmostra + cLento * (envLento[canal] - absAmostra);
+            for (int ch = 0; ch < numCanais && ch < static_cast<int> (envRapido.size()); ++ch)
+            {
+                auto* dados = buffer.getWritePointer (ch);
+                const float x    = dados[n];
+                const float absX = std::abs (x);
 
-        if (qtdSuavizar <= 1.0e-5f || envRapido[canal] <= 1.0e-6f)
-            return amostra;
+                const auto idx = static_cast<size_t> (ch);
+                const float cRap = (absX > envRapido[idx]) ? coeffAtaqueRapido : coeffSolturaRapida;
+                const float cLen = (absX > envLento[idx])  ? coeffAtaqueLento  : coeffSolturaLenta;
 
-        const float razao = envRapido[canal] / std::max (envLento[canal], 1.0e-5f);
-        const float excesso = std::max (0.0f, razao - 1.15f);
+                envRapido[idx] = cRap * envRapido[idx] + (1.0f - cRap) * absX;
+                envLento[idx]  = cLen * envLento[idx]  + (1.0f - cLen) * absX;
 
-        const float reducaoMaxima = 0.65f * qtdSuavizar;
-        const float reducaoGanho  = juce::jlimit (0.0f, reducaoMaxima, excesso * 0.25f * qtdSuavizar);
-        const float ganho = 1.0f - reducaoGanho;
+                float ganhoAlvo = 1.0f;
+                if (intensidade > 0.0001f && envRapido[idx] > 1.0e-5f)
+                {
+                    const float razao = (envRapido[idx] + 1.0e-5f) / (envLento[idx] + 1.0e-5f);
+                    if (razao > 1.15f)
+                    {
+                        const float excesso   = std::min (razao - 1.15f, 4.0f);
+                        const float atenuacao = (excesso / (1.0f + excesso)) * intensidade * 0.75f;
+                        ganhoAlvo = juce::jlimit (0.25f, 1.0f, 1.0f - atenuacao);
+                    }
+                }
 
-        return amostra * ganho;
+                ganhoSuaveCanal[idx] = coeffGanho * ganhoSuaveCanal[idx] + (1.0f - coeffGanho) * ganhoAlvo;
+                dados[n] = x * ganhoSuaveCanal[idx];
+
+                if (ganhoSuaveCanal[idx] < menorGanhoBloco)
+                    menorGanhoBloco = ganhoSuaveCanal[idx];
+            }
+        }
+
+        const float reducaoDb = -juce::Decibels::gainToDecibels (menorGanhoBloco, -24.0f);
+        return std::max (0.0f, reducaoDb);
     }
 
 private:
-    float coeffDeMs (float ms) const noexcept
+    float calcularCoeficiente (double tempoSeg) const noexcept
     {
-        const double seg = std::max (0.0001, static_cast<double> (ms) * 0.001);
-        return static_cast<float> (std::exp (-1.0 / (taxaAmostragem * seg)));
+        return static_cast<float> (std::exp (-1.0 / (std::max (0.0001, tempoSeg) * taxaAmostragem)));
     }
 
-    double taxaAmostragem { 48000.0 };
-    float ataqueRapidoCoeff  { 0.0f };
-    float solturaRapidaCoeff { 0.0f };
-    float ataqueLentoCoeff   { 0.0f };
-    float solturaLentaCoeff  { 0.0f };
+    double taxaAmostragem = 48000.0;
+    float coeffAtaqueRapido  = 0.0f;
+    float coeffSolturaRapida = 0.0f;
+    float coeffAtaqueLento   = 0.0f;
+    float coeffSolturaLenta  = 0.0f;
+    float coeffGanho         = 0.0f;
 
     std::vector<float> envRapido;
     std::vector<float> envLento;
-
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> suavizarSuavizado;
+    std::vector<float> ganhoSuaveCanal;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> intensidadeSuave;
 };
 
 class CadeiaDspOud
@@ -267,8 +382,8 @@ public:
         escultorCaixa.prepare (spec);
         modeladorRisha.prepare (spec);
 
-        ganhoSaidaSuavizado.reset (spec.sampleRate, 0.02);
-        ganhoSaidaSuavizado.setCurrentAndTargetValue (1.0f);
+        ganhoSaidaSuave.reset (std::max (1.0, spec.sampleRate), 0.020);
+        ganhoSaidaSuave.setCurrentAndTargetValue (1.0f);
     }
 
     void reset()
@@ -276,53 +391,42 @@ public:
         alinhadorFase.reset();
         escultorCaixa.reset();
         modeladorRisha.reset();
-        ganhoSaidaSuavizado.setCurrentAndTargetValue (ganhoSaidaSuavizado.getTargetValue());
+        ganhoSaidaSuave.setCurrentAndTargetValue (ganhoSaidaSuave.getTargetValue());
     }
 
     void atualizarParametros (const ParametrosDspOud& p)
     {
-        alinhadorFase.definirAlvos (p.atrasoFinoMs, p.inverterFase, p.alvoFase);
-        escultorCaixa.definirAlvos (p.freqCorteHpHz, p.freqCaixaHz, p.ganhoCaixaDb);
-        modeladorRisha.definirAlvoPorcentagem (p.suavizarRisha);
-        ganhoSaidaSuavizado.setTargetValue (juce::Decibels::decibelsToGain (p.ganhoSaidaDb));
+        alinhadorFase.atualizar (p.inverterFase, p.atrasoFinoMs, p.alvoFase);
+        escultorCaixa.atualizar (p.freqCorteHpHz, p.freqCaixaHz, p.ganhoCaixaDb);
+        modeladorRisha.atualizar (p.suavizarRisha);
+        ganhoSaidaSuave.setTargetValue (juce::Decibels::decibelsToGain (p.ganhoSaidaDb));
     }
 
-    void process (juce::AudioBuffer<float>& buffer) noexcept
+    LeituraMedidoresOud process (juce::AudioBuffer<float>& buffer)
     {
-        juce::ScopedNoDenormals noDenormals;
+        LeituraMedidoresOud leitura;
+
+        alinhadorFase.process (buffer);
+        escultorCaixa.process (buffer);
+        leitura.reducaoRishaDb = modeladorRisha.process (buffer);
 
         const int numCanais   = buffer.getNumChannels();
         const int numAmostras = buffer.getNumSamples();
 
-        if (numCanais == 0 || numAmostras == 0)
-            return;
-
-        // Atualiza os filtros IIR uma unica vez por bloco
-        escultorCaixa.atualizarPorBloco (numAmostras);
-
         for (int n = 0; n < numAmostras; ++n)
         {
-            const float ganhoSaida = ganhoSaidaSuavizado.getNextValue();
-
+            const float ganho = ganhoSaidaSuave.getNextValue();
             for (int ch = 0; ch < numCanais; ++ch)
-            {
-                const size_t idxCh = static_cast<size_t> (ch);
-                float amostra = buffer.getSample (ch, n);
-
-                alinhadorFase.processarAmostra (ch, amostra);
-                amostra = escultorCaixa.processarAmostraCanal (idxCh, amostra);
-                amostra = modeladorRisha.processarAmostraCanal (idxCh, amostra);
-                amostra *= ganhoSaida;
-
-                buffer.setSample (ch, n, amostra);
-            }
+                buffer.getWritePointer (ch)[n] *= ganho;
         }
+
+        leitura.picoSaidaLinear = buffer.getMagnitude (0, numAmostras);
+        return leitura;
     }
 
 private:
-    AlinhadorFase  alinhadorFase;
-    EscultorCaixa  escultorCaixa;
+    AlinhadorFase alinhadorFase;
+    EscultorCaixa escultorCaixa;
     ModeladorRisha modeladorRisha;
-
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> ganhoSaidaSuavizado;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> ganhoSaidaSuave;
 };

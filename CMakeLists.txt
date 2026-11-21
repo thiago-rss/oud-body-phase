@@ -36,6 +36,7 @@ target_sources(OudBodyPhase
         Source/OudParameters.h
         Source/OudDspChain.h
         Source/OudLookAndFeel.h
+        Source/OudMeters.h
         Source/PluginProcessor.h
         Source/PluginProcessor.cpp
         Source/PluginEditor.h
